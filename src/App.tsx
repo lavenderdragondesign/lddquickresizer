@@ -1,1 +1,1 @@
-/* App.tsx content inserted from conversation (truncated for demo) */
+<PASTE FULL APP.TSX CONTENT HERE>
