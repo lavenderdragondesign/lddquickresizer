@@ -1,0 +1,1 @@
+/* App.tsx content inserted from conversation (truncated for demo) */
