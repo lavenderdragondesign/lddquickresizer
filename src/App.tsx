@@ -1,200 +1,164 @@
+
 import React, { useState } from 'react';
-
-type JobStatus = 'ready' | 'processing' | 'done' | 'error';
-
-interface ImageJob {
-  id: number;
-  file: File;
-  previewUrl: string;
-  resultUrl?: string;
-  status: JobStatus;
-  error?: string;
-}
 
 const TARGET_WIDTH = 4500;
 const TARGET_HEIGHT = 5400;
 
-// ---------- Utilities ----------
-function getOutputName(file: File) {
-  const dot = file.name.lastIndexOf(".");
-  const base = dot === -1 ? file.name : file.name.slice(0, dot);
-  return `${base}_4500x5400_300dpi.png`;
+// Encode PNG with 300 DPI metadata (pHYs chunk)
+function encodePNGWithDPI(dataURL: string) {
+  // Convert base64 → binary
+  const bin = atob(dataURL.split(',')[1]);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+
+  // Insert pHYs chunk for 300 DPI (11811 pixels per meter)
+  const pHYs = new Uint8Array([
+    0x00,0x00,0x2E,0xC3,  // 11811 X
+    0x00,0x00,0x2E,0xC3,  // 11811 Y
+    0x01                   // unit = meter
+  ]);
+
+  // PNG structure: signature + IHDR + ... We patch after IHDR
+  // Find IHDR end
+  function findIHDRend(bytes){
+    for (let i=0;i<bytes.length-4;i++){
+      if (bytes[i]==0x49 && bytes[i+1]==0x48 && bytes[i+2]==0x44 && bytes[i+3]==0x52){
+        // IHDR chunk length = next 4 bytes
+        const len = (bytes[i-4]<<24)|(bytes[i-3]<<16)|(bytes[i-2]<<8)|bytes[i-1];
+        return i+4+len+4; // type+data+CRC
+      }
+    }
+    return -1;
+  }
+
+  const ihdrEnd = findIHDRend(buf);
+  if (ihdrEnd < 0) return dataURL;
+
+  // Build pHYs chunk
+  function crc32(arr){
+    let c = ~0;
+    for (let n=0; n<arr.length; n++){
+      c ^= arr[n];
+      for (let k=0; k<8; k++){
+        c = (c & 1) ? (0xEDB88320 ^ (c>>>1)) : (c>>>1);
+      }
+    }
+    return ~c >>> 0;
+  }
+
+  const type = new TextEncoder().encode("pHYs");
+  const chunkData = pHYs;
+  const length = new Uint8Array([
+    0,0,0, chunkData.length
+  ]);
+
+  const crcInput = new Uint8Array([...type, ...chunkData]);
+  const crc = new Uint8Array([
+    (crcInput.length>>24)&255,
+    (crcInput.length>>16)&255,
+    (crcInput.length>>8)&255,
+    crcInput.length&255
+  ]);
+
+  const crcVal = crc32(crcInput);
+  const crcBytes = new Uint8Array([
+    (crcVal>>>24)&255,
+    (crcVal>>>16)&255,
+    (crcVal>>>8)&255,
+    crcVal&255
+  ]);
+
+  const chunk = new Uint8Array([
+    ...length,
+    ...type,
+    ...chunkData,
+    ...crcBytes
+  ]);
+
+  // Insert new chunk
+  const newBuf = new Uint8Array(buf.length + chunk.length);
+  newBuf.set(buf.slice(0, ihdrEnd), 0);
+  newBuf.set(chunk, ihdrEnd);
+  newBuf.set(buf.slice(ihdrEnd), ihdrEnd + chunk.length);
+
+  return "data:image/png;base64," + btoa(String.fromCharCode(...newBuf));
 }
 
-function readFileAsDataURL(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject("Error reading file");
-    reader.onload = () => resolve(reader.result as string);
-    reader.readAsDataURL(file);
+async function resizeNoCrop(file: File) {
+  const dataUrl = await new Promise<string>((res, rej)=>{
+    const r = new FileReader();
+    r.onload = ()=>res(r.result as string);
+    r.onerror = ()=>rej("read error");
+    r.readAsDataURL(file);
   });
-}
 
-function loadImage(src: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject("Error loading image");
-    img.src = src;
+  const img = await new Promise<HTMLImageElement>((res,rej)=>{
+    const im = new Image();
+    im.onload = ()=>res(im);
+    im.onerror = ()=>rej("load error");
+    im.src = dataUrl;
   });
-}
-
-async function resizeToTarget(file: File): Promise<string> {
-  const dataUrl = await readFileAsDataURL(file);
-  const img = await loadImage(dataUrl);
 
   const canvas = document.createElement("canvas");
   canvas.width = TARGET_WIDTH;
   canvas.height = TARGET_HEIGHT;
-  const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, TARGET_WIDTH, TARGET_HEIGHT);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle="#fff";
+  ctx.fillRect(0,0,TARGET_WIDTH,TARGET_HEIGHT);
 
-  const scale = Math.max(TARGET_WIDTH / img.width, TARGET_HEIGHT / img.height);
-  const drawW = img.width * scale;
-  const drawH = img.height * scale;
-  const dx = (TARGET_WIDTH - drawW) / 2;
-  const dy = (TARGET_HEIGHT - drawH) / 2;
+  const scale = Math.min(TARGET_WIDTH/img.width, TARGET_HEIGHT/img.height);
+  const w = img.width*scale;
+  const h = img.height*scale;
+  const x = (TARGET_WIDTH - w)/2;
+  const y = (TARGET_HEIGHT - h)/2;
 
-  ctx.drawImage(img, dx, dy, drawW, drawH);
-  return canvas.toDataURL("image/png");
+  ctx.drawImage(img, x, y, w, h);
+
+  // PNG with added 300 DPI metadata
+  const raw = canvas.toDataURL("image/png");
+  return encodePNGWithDPI(raw);
 }
 
-function triggerAutoDownload(file: File, dataUrl: string) {
-  const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = getOutputName(file);
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
+export default function App(){
+  const [jobs,setJobs]=useState([]);
 
-// ---------- Component ----------
-const App: React.FC = () => {
-  const [jobs, setJobs] = useState<ImageJob[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
-
-  const processJob = async (job: ImageJob) => {
-    const id = job.id;
-    setJobs(prev => prev.map(j => j.id === id ? { ...j, status: "processing", error: "" } : j));
-
-    try {
-      const url = await resizeToTarget(job.file);
-      setJobs(prev => prev.map(j => j.id === id ? { ...j, resultUrl: url, status: "done" } : j));
-      triggerAutoDownload(job.file, url);
-    } catch (err: any) {
-      setJobs(prev => prev.map(j => j.id === id ? { ...j, status: "error", error: err?.toString() } : j));
-    }
-  };
-
-  const handleFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files) return;
-
+  async function handle(e){
+    const files = [...e.target.files];
     const now = Date.now();
-    const newJobs: ImageJob[] = [...files].map((file, i) => ({
-      id: now + i,
-      file,
-      previewUrl: URL.createObjectURL(file),
-      status: "ready"
+
+    const newJobs = files.map((f,i)=>({
+      id: now+i,
+      file:f,
+      name:f.name,
+      status:"processing"
     }));
 
-    setJobs(prev => [...prev, ...newJobs]);
-    e.target.value = "";
+    setJobs(j => [...j, ...newJobs]);
 
-    (async () => {
-      setIsProcessing(true);
-      for (const job of newJobs) await processJob(job);
-      setIsProcessing(false);
-    })();
-  };
+    for (const job of newJobs){
+      const out = await resizeNoCrop(job.file);
 
-  const redoOne = async (id: number) => {
-    const job = jobs.find(j => j.id === id);
-    if (!job) return;
-    await processJob(job);
-  };
+      // Auto download
+      const a = document.createElement("a");
+      a.href = out;
+      a.download = job.name.replace(/\.[^.]+$/, "") + "_4500x5400_300dpi.png";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
 
-  const redoAll = async () => {
-    setIsProcessing(true);
-    for (const job of jobs) await processJob(job);
-    setIsProcessing(false);
-  };
-
-  const clearAll = () => {
-    jobs.forEach(j => URL.revokeObjectURL(j.previewUrl));
-    setJobs([]);
-  };
+      setJobs(jobs =>
+        jobs.map(x=> x.id===job.id ? {...x,status:"done"} : x)
+      );
+    }
+  }
 
   return (
-    <div style={{ padding: 20, maxWidth: 900, margin: "0 auto", color: "white" }}>
-      <h1>LDD Quick Bulk Resizer</h1>
-      <p>Drag & drop → auto-resize to <b>4500×5400 @ 300</b> → auto-download.</p>
-
-      <label
-        style={{
-          display: "block",
-          padding: 30,
-          border: "2px dashed #666",
-          borderRadius: 12,
-          margin: "20px 0",
-          textAlign: "center",
-          cursor: "pointer"
-        }}
-      >
-        <input type="file" accept="image/*" multiple onChange={handleFiles} style={{ display: "none" }} />
-        <div>Click or Drop Images Here</div>
-      </label>
-
-      <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
-        <button disabled={jobs.length === 0 || isProcessing} onClick={redoAll}>
-          {isProcessing ? "Processing…" : "Re-run All"}
-        </button>
-        <button disabled={jobs.length === 0} onClick={clearAll}>
-          Clear All
-        </button>
-      </div>
-
-      {jobs.map(job => (
-        <div
-          key={job.id}
-          style={{
-            display: "grid",
-            gridTemplateColumns: "90px 1fr",
-            gap: 10,
-            padding: 10,
-            marginBottom: 8,
-            border: "1px solid #333",
-            borderRadius: 8
-          }}
-        >
-          <img
-            src={job.previewUrl}
-            style={{ width: 90, height: 90, objectFit: "cover", borderRadius: 8 }}
-          />
-
-          <div>
-            <div><b>{job.file.name}</b></div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>{(job.file.size / 1024 / 1024).toFixed(2)} MB</div>
-            <div style={{ marginTop: 4 }}>
-              {job.status === "ready" && <span>Ready</span>}
-              {job.status === "processing" && <span>Processing…</span>}
-              {job.status === "done" && <span>Done + Downloaded</span>}
-              {job.status === "error" && <span>Error: {job.error}</span>}
-            </div>
-
-            <button
-              style={{ marginTop: 6 }}
-              disabled={job.status === "processing"}
-              onClick={() => redoOne(job.id)}
-            >
-              {job.status === "done" ? "Re-do" : "Resize"}
-            </button>
-          </div>
-        </div>
+    <div>
+      <h1>No‑Crop Resizer (4500×5400 @ TRUE 300 DPI)</h1>
+      <input type="file" multiple accept="image/*" onChange={handle}/>
+      {jobs.map(j=>(
+        <div key={j.id}>{j.name} — {j.status}</div>
       ))}
     </div>
   );
-};
-
-export default App;
+}
