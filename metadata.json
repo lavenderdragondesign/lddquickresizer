@@ -1,0 +1,5 @@
+{
+  "name": "LDD Bulk Resizer",
+  "description": "A powerful browser-based tool to bulk resize images using customizable profiles, supporting drag-and-drop, aspect ratio control, and ZIP export.",
+  "requestFramePermissions": []
+}
